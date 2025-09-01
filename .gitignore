@@ -1,0 +1,25 @@
+# Byte-/Cache-Dateien
+__pycache__/
+*.py[cod]
+*.egg-info/
+
+# Venv
+.venv/
+
+# IDE
+.vscode/
+.idea/
+.DS_Store
+
+# Logs
+*.log
+watch.log
+
+# Env/Secrets
+.env
+.env.*
+
+# Python tooling
+.pytest_cache/
+.mypy_cache/
+
