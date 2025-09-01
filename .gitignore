@@ -18,6 +18,7 @@ watch.log
 # Env/Secrets
 .env
 .env.*
+!.env.example
 
 # Python tooling
 .pytest_cache/
