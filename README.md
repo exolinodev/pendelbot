@@ -50,6 +50,6 @@ kill $(cat watch.pid)
 ```
 
 ## Sicherheit
-- Lege den API Key ausschließlich in `.env` ab.
+- Lege den API Key ausschliesslich in `.env` ab.
 - Nutze API-Einschränkungen (HTTP-Referer/Quellen-IP) und rotiere Keys bei Bedarf.
 
