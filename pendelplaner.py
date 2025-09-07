@@ -20,6 +20,29 @@ def render_weekly_output(base: datetime, cfg: dict) -> None:
         except Exception:
             weekly_pr = None
     preferred_days = _parse_days_list(GYM_PREFERRED_DAYS)
+    # Pre-select gym days: require up to GYM_MAX_DAYS_PER_WEEK office days for gym
+    force_gym_set: set[int] = set()
+    if GYM_ENABLED and GYM_MAX_DAYS_PER_WEEK > 0:
+        desired_gym = GYM_MAX_DAYS_PER_WEEK
+        candidates_pref: list[int] = []
+        candidates_other: list[int] = []
+        for i, entry in enumerate(plan):
+            if entry.get("plan") is None:
+                continue
+            # Skip days without office presence entirely
+            if entry.get("mode") in {"HO", "OFF"}:
+                continue
+            token = _weekday_token(entry["day"])
+            if token in preferred_days:
+                candidates_pref.append(i)
+            else:
+                candidates_other.append(i)
+        chosen = candidates_pref[:desired_gym]
+        if len(chosen) < desired_gym:
+            chosen += candidates_other[: (desired_gym - len(chosen))]
+        force_gym_set = set(chosen)
+    # Running timebank balance across the week
+    timebank_balance = TIMEBANK_CURRENT_MIN
     for idx, entry in enumerate(plan, start=1):
         day_dt = entry["day"]
         day_label = day_dt.strftime("%a, %b %d")
@@ -49,38 +72,36 @@ def render_weekly_output(base: datetime, cfg: dict) -> None:
         e = entry["plan"]["inbound"]
 
         work_minutes = int(WORK_HOURS * 60)
+        # Baseline morning arrival for this day
         arrival_office = m['best_arrival']
-        earliest_end = arrival_office + timedelta(minutes=work_minutes)
-        lunch_minutes = e['lunch_minutes']
-        base_breaks = lunch_minutes + PERSONAL_BREAKS_MIN
-        base_end = earliest_end + timedelta(minutes=base_breaks)
-
-        # Standard plan: leave at earliest possible end (base_end)
-        try:
-            std_inbound = compute_drive_duration_minutes(DESTINATION_ADDRESS, ORIGIN_ADDRESS, base_end)
-        except Exception:
-            std_inbound = e["evening_duration_minutes"]
-        standard_total = m["best_duration_minutes"] + std_inbound
 
         # Consider optimized day including extension/morning tweak
         with suppress_info_logs():
-            improved = optimize_day_with_extension(day_dt) or None
+            # Keep gym exploration enabled even with no-cache (fast mode inside chooser), but skip heavy day re-optimization
+            improved = None if DISABLE_ROUTE_CACHE else (optimize_day_with_extension(day_dt) or None)
             # Timebank-aware option: allow earlier leave + wait if activity is gym and we can spend timebank
+            available_tb = timebank_balance if EXTENSION_ACTIVITY == "gym" else 0
             timebank_option = None
-            available_tb = TIMEBANK_CURRENT_MIN if EXTENSION_ACTIVITY == "gym" else 0
-            if available_tb > 0:
-                try:
-                    tb = choose_best_evening_departure_with_timebank(arrival_office, available_tb)
-                    timebank_option = tb.get("spend")
-                except Exception:
-                    timebank_option = None
+            timebank_any = None
+            try:
+                tb = choose_best_evening_departure_with_timebank(arrival_office, available_tb)
+                timebank_option = tb.get("spend")
+                timebank_any = tb.get("best_any")
+            except Exception as ex:
+                logger.warning("Gym/timebank evaluation failed: %s", ex)
+                timebank_option = None
+                timebank_any = None
 
         # Decide best option with gym cap enforcement
         improved_total = improved['total_travel_minutes'] if improved else float('inf')
         tb_total = (m['best_duration_minutes'] + (timebank_option['evening_duration_minutes'] if timebank_option else 0)) if timebank_option else float('inf')
-        can_use_gym_today = GYM_ENABLED and (gym_days_used < GYM_MAX_DAYS_PER_WEEK) and (_weekday_token(day_dt) in preferred_days)
-        # Prefer gym on preferred days when available
-        choose_timebank = (timebank_option is not None) and can_use_gym_today
+        # Enforce gym target: must_do_gym if this day is pre-selected
+        must_do_gym = (idx - 1) in force_gym_set
+        can_use_gym_today = GYM_ENABLED and ((gym_days_used < GYM_MAX_DAYS_PER_WEEK and (_weekday_token(day_dt) in preferred_days)) or must_do_gym)
+        # Prefer/force gym on pre-selected days when available; fall back to best_any if no spend option
+        if timebank_option is None and must_do_gym and timebank_any is not None:
+            timebank_option = timebank_any
+        choose_timebank = (timebank_option is not None) and (must_do_gym or can_use_gym_today)
         if choose_timebank:
             rec_m_dep = m['best_departure']
             rec_m_arr = m['best_arrival']
@@ -92,6 +113,10 @@ def render_weekly_output(base: datetime, cfg: dict) -> None:
             off2gym = timebank_option.get('office_to_gym_minutes', 0)
             chosen_total = rec_m_dur + off2gym + rec_e_dur
             chosen_mode = "timebank"
+            chosen_lunch_minutes = e['lunch_minutes']
+            # If leave mode is 'earliest', spending is zero; do not reduce timebank
+            if GYM_LEAVE_MODE == "earliest":
+                extend_minutes = 0
         elif improved:
             rec_m_dep = improved['morning']['best_departure']
             rec_m_arr = improved['morning']['best_arrival']
@@ -102,6 +127,9 @@ def render_weekly_output(base: datetime, cfg: dict) -> None:
             extend_minutes = max(0, improved.get('extend_minutes', 0))
             chosen_total = improved['total_travel_minutes']
             chosen_mode = "extension"
+            chosen_lunch_minutes = improved.get('lunch_minutes', e['lunch_minutes'])
+            # If an extension was chosen, reflect any lifestyle penalty in benefits
+            improved_penalty = max(0, int(round(improved.get('penalty_minutes', 0))))
         else:
             rec_m_dep = m['best_departure']
             rec_m_arr = m['best_arrival']
@@ -110,11 +138,56 @@ def render_weekly_output(base: datetime, cfg: dict) -> None:
             rec_e_dur = e['evening_duration_minutes']
             rec_e_arr = e['evening_arrival_home']
             # Extra time beyond base_end
-            extend_minutes = max(0, int(round((rec_e_dep - base_end).total_seconds() / 60.0)))
+            extend_minutes = 0
             chosen_total = rec_m_dur + rec_e_dur
             chosen_mode = "base"
+            chosen_lunch_minutes = e['lunch_minutes']
 
-        benefit_save = max(0, int(round(standard_total - chosen_total)))
+        # Force gym on pre-selected days even if not strictly better
+        if (not DISABLE_ROUTE_CACHE) and (chosen_mode != "timebank") and ((idx - 1) in force_gym_set) and (timebank_any is not None):
+            rec_m_dep = m['best_departure']
+            rec_m_arr = m['best_arrival']
+            rec_m_dur = m['best_duration_minutes']
+            rec_e_dep = timebank_any['evening_departure']
+            rec_e_dur = timebank_any['evening_duration_minutes']
+            rec_e_arr = timebank_any['evening_arrival_home']
+            extend_minutes = -int(round(timebank_any.get('spend_minutes', 0)))
+            off2gym = timebank_any.get('office_to_gym_minutes', 0)
+            chosen_total = rec_m_dur + off2gym + rec_e_dur
+            chosen_mode = "timebank"
+            chosen_lunch_minutes = e['lunch_minutes']
+
+        # Recompute earliest/base end using the actual chosen morning arrival and chosen lunch minutes
+        earliest_end = rec_m_arr + timedelta(minutes=work_minutes)
+        base_breaks = chosen_lunch_minutes + PERSONAL_BREAKS_MIN
+        base_end = earliest_end + timedelta(minutes=base_breaks)
+
+        # Standard plan based on this day's actual arrival and breaks, pessimized in rush window
+        try:
+            std_inbound_raw = compute_drive_duration_minutes(DESTINATION_ADDRESS, ORIGIN_ADDRESS, base_end)
+        except Exception:
+            std_inbound_raw = e["evening_duration_minutes"]
+        std_inbound = std_inbound_raw
+        if _is_in_rush_window(base_end):
+            # Try small worst-of probing unless budget is tight or cache disabled
+            probed = [std_inbound_raw]
+            if (not DISABLE_ROUTE_CACHE) and (not _budget_soft_limit_reached()):
+                for off in _parse_int_list(EVENING_STD_PROBE_OFFSETS_MIN):
+                    try:
+                        if off <= 0:
+                            continue
+                        dep = base_end + timedelta(minutes=off)
+                        d = compute_drive_duration_minutes(DESTINATION_ADDRESS, ORIGIN_ADDRESS, dep)
+                        probed.append(d)
+                    except Exception:
+                        break
+            std_inbound = max(probed) + EVENING_STD_EXTRA_BUFFER_MIN
+            std_inbound = max(std_inbound, std_inbound_raw + EVENING_STD_BUFFER_MIN)
+        standard_total = rec_m_dur + std_inbound
+
+        # Benefit is the reduction in evening drive time (morning is identical in standard vs chosen)
+        # For gym days, Office→Gym is not part of regular commute and is excluded by comparing evening legs only.
+        benefit_save = max(0, fmt_minutes(std_inbound) - fmt_minutes(rec_e_dur))
 
         # Render day
         day_prefix = f"{EMO_OK} " if EMO_OK else ""
@@ -140,18 +213,35 @@ def render_weekly_output(base: datetime, cfg: dict) -> None:
             print(f"   {EMO_OFFICE} Leave Office:    {fmt_hhmm(rec_e_dep)}")
         print(f"   {EMO_HOME} Arrive Home:     {fmt_hhmm(rec_e_arr)} ({fmt_minutes(rec_e_dur)} min commute)")
         print("")
-        print(f"   {EMO_STAR} Benefit: You SAVE {fmt_minutes(benefit_save)} minutes of driving.")
+        # BENEFITS section
+        print("   ✅ BENEFITS OF THIS PLAN:")
+        print(f"    {_BULLET}Time Saved:  {fmt_minutes(benefit_save)} minutes")
+        if chosen_mode == "extension":
+            print(f"    {_BULLET}Traffic:     Completely avoids evening congestion by leaving after the rush.")
+            if extend_minutes > 0:
+                print(f"    {_BULLET}Productivity: Gain {fmt_dur_hm(extend_minutes)} of quiet, focused time at the office.")
+            if 'improved_penalty' in locals() and improved_penalty > 0:
+                print(f"    {_BULLET}Balance:     Includes {fmt_minutes(improved_penalty)} min lifestyle penalty for late departure.")
+        elif chosen_mode == "timebank":
+            # Estimate avoided stop-and-go as baseline evening drive minus late gym→home drive (approx)
+            avoided = max(0, fmt_minutes(std_inbound) - fmt_minutes(rec_e_dur))
+            print(f"    {_BULLET}Traffic:     Avoids {avoided}+ minutes of stressful, stop-and-go driving.")
+            print(f"    {_BULLET}Efficiency:  Gym workout is completed, freeing up your evening.")
+        else:
+            print(f"    {_BULLET}Traffic:     Uses the lowest-traffic return window for today.")
         if chosen_mode == "timebank":
-            print(f"    commutes: Morning {fmt_minutes(rec_m_dur)} min / Office→Gym {fmt_minutes(off2gym)} min + Gym→Home {fmt_minutes(rec_e_dur)} min | Total: {fmt_minutes(chosen_total)} min")
+            # Show both: regular commute total and gym travel separately
+            reg_total = fmt_minutes(rec_m_dur + rec_e_dur)
+            print(f"    commutes: Morning {fmt_minutes(rec_m_dur)} min / Evening {fmt_minutes(rec_e_dur)} min | Regular Total: {reg_total} min (Gym extra: Office→Gym {fmt_minutes(off2gym)} min)")
         else:
             print(f"    commutes: Morning {fmt_minutes(rec_m_dur)} min / Evening {fmt_minutes(rec_e_dur)} min | Total: {fmt_minutes(chosen_total)} min")
         # Details section for the day
         print("")
         print("   " + bold("DETAILS:"))
-        lunch_end = arrival_office + timedelta(minutes=work_minutes + lunch_minutes)
+        lunch_end = rec_m_arr + timedelta(minutes=work_minutes + chosen_lunch_minutes)
         personal_end = base_end  # cumulative after lunch + personal breaks
         print(f"   • Work Required:   {fmt_dur_hm(work_minutes)} (login)")
-        print(f"   • Lunch:           +{fmt_minutes(lunch_minutes)} min → {fmt_hhmm(lunch_end)}")
+        print(f"   • Lunch:           +{fmt_minutes(chosen_lunch_minutes)} min → {fmt_hhmm(lunch_end)}")
         if PERSONAL_BREAKS_MIN:
             print(f"   • Personal Breaks: +{fmt_minutes(PERSONAL_BREAKS_MIN)} min → {fmt_hhmm(personal_end)}")
         print(f"   • Earliest Leave:  {fmt_hhmm(base_end)}")
@@ -159,13 +249,16 @@ def render_weekly_output(base: datetime, cfg: dict) -> None:
             print(f"   • Extra at Office: {fmt_dur_hm(extend_minutes)} (beyond earliest)")
         if chosen_mode == "timebank":
             spend_abs = abs(extend_minutes)
-            projected_tb = max(0, TIMEBANK_CURRENT_MIN - spend_abs)
+            projected_tb = timebank_balance if (GYM_LEAVE_MODE == "earliest") else max(0, timebank_balance - spend_abs)
             gym_addr = (timebank_option or {}).get('gym_address', 'Gym')
             gym_train = (timebank_option or {}).get('train_minutes', 0)
             off2gym = (timebank_option or {}).get('office_to_gym_minutes', 0)
-            print(f"   • Leave Early:     {fmt_dur_hm(spend_abs)} earlier → {gym_addr}")
+            if spend_abs > 0:
+                print(f"   • Leave Early:     {fmt_dur_hm(spend_abs)} earlier → {gym_addr}")
             print(f"   • Gym Session:     {fmt_dur_hm(gym_train)} (Commute Office→Gym {fmt_minutes(off2gym)} min)")
-            print(f"   • Timebank Today:  spend {fmt_minutes(spend_abs)} min | projected {fmt_minutes(projected_tb)}/{fmt_minutes(TIMEBANK_CAP_MIN)}")
+            if spend_abs > 0:
+                net_spend = max(0, fmt_minutes(spend_abs) - fmt_minutes(benefit_save))
+                print(f"   • Timebank:        Spend {fmt_minutes(spend_abs)} min (net {fmt_minutes(net_spend)} min) | New Balance: {fmt_minutes(projected_tb)}/{fmt_minutes(TIMEBANK_CAP_MIN)}")
         # Traffic comparison
         print(f"   • Evening Traffic: baseline {fmt_minutes(int(round(std_inbound)))} min → chosen {fmt_minutes(int(round(rec_e_dur)))} min")
         print("")
@@ -177,9 +270,13 @@ def render_weekly_output(base: datetime, cfg: dict) -> None:
         print(f"   • Total Commute:   {fmt_minutes(standard_total)} min")
 
         weekly_travel_standard += standard_total
-        weekly_travel_chosen += chosen_total
+        # Weekly chosen time excludes Office→Gym on gym days to reflect regular commute only
+        weekly_travel_chosen += ((rec_m_dur + rec_e_dur) if (chosen_mode == "timebank") else chosen_total)
         if chosen_mode == "timebank":
             gym_days_used += 1
+            # Update running timebank after using it (no deduction if earliest mode)
+            if GYM_LEAVE_MODE != "earliest":
+                timebank_balance = max(0, timebank_balance - abs(extend_minutes))
         print(magenta(hr()))
         if weekly_pr:
             weekly_pr.update(1)
@@ -219,14 +316,15 @@ import argparse
 import json
 import atexit
 import time
+import math
 from dataclasses import dataclass
 from contextlib import contextmanager
 from datetime import datetime, timedelta
 from zoneinfo import ZoneInfo
 from dotenv import dotenv_values
 
-ORIGIN_ADDRESS = "Rümlangstrasse 54, 8052 Zürich"
-DESTINATION_ADDRESS = "Bahnhofstrasse 25, 5647 Oberrüti"
+ORIGIN_ADDRESS = "<HOME_ADDRESS>"
+DESTINATION_ADDRESS = "<OFFICE_ADDRESS>"
 
 # Späteste Ankunftszeit (lokal, 24h-Format "HH:MM")
 LATEST_ARRIVAL_LOCAL = "09:00"
@@ -390,21 +488,21 @@ class RoutesApiClient:
         Uses time-bucketing via ROUTE_CACHE_GRANULARITY_MIN to maximize cache hits.
         """
         # Shared globals for cache and budgeting
-        global API_CALL_COUNT, ROUTE_CACHE, ROUTE_CACHE_TS
+        global API_CALL_COUNT, ROUTE_CACHE, ROUTE_CACHE_TS, SESSION_ROUTE_CACHE
 
         # Normalize time to cache granularity bucket and build candidates
         key_time = _floor_dt_to_step(departure_dt_local, ROUTE_CACHE_GRANULARITY_MIN)
-        try:
-            tz_name = getattr(TZ, "key", str(TZ))
-        except Exception:
-            tz_name = "TZ"
-        canonical_key = (origin_addr, destination_addr, f"{tz_name}|{key_time.strftime('%Y-%m-%d %H:%M')}")
+        canonical_key = _canonical_key(origin_addr, destination_addr, key_time.strftime('%Y-%m-%d %H:%M'))
+        # Check session cache first (always on), then persistent cache if allowed
         for k in _candidate_cache_keys(origin_addr, destination_addr, departure_dt_local):
-            if k in ROUTE_CACHE:
+            if k in SESSION_ROUTE_CACHE:
+                return SESSION_ROUTE_CACHE[k]
+            if (not DISABLE_ROUTE_CACHE) and (k in ROUTE_CACHE):
                 dur = ROUTE_CACHE[k]
                 # Promote to canonical for faster next hits
                 ROUTE_CACHE[canonical_key] = dur
                 ROUTE_CACHE_TS[canonical_key] = ROUTE_CACHE_TS.get(k, time.time())
+                SESSION_ROUTE_CACHE[canonical_key] = dur
                 return dur
 
         # Budget check
@@ -439,8 +537,10 @@ class RoutesApiClient:
         dur_min = self._parse_duration_to_minutes(dur)
 
         # Save to shared cache and update budget counter
-        ROUTE_CACHE[canonical_key] = dur_min
-        ROUTE_CACHE_TS[canonical_key] = time.time()
+        SESSION_ROUTE_CACHE[canonical_key] = dur_min
+        if not DISABLE_ROUTE_CACHE:
+            ROUTE_CACHE[canonical_key] = dur_min
+            ROUTE_CACHE_TS[canonical_key] = time.time()
         API_CALL_COUNT += 1
 
         return dur_min
@@ -608,6 +708,27 @@ try:
 except ValueError:
     AVOID_STEP_MINUTES = 15
 
+# Standard-plan pessimism (rush-hour adjustment)
+RUSH_WINDOW_START_LOCAL = CONFIG.get("RUSH_WINDOW_START_LOCAL", "16:30")
+RUSH_WINDOW_END_LOCAL = CONFIG.get("RUSH_WINDOW_END_LOCAL", "19:00")
+try:
+    EVENING_STD_BUFFER_MIN = int(CONFIG.get("EVENING_STD_BUFFER_MIN", "8"))
+except ValueError:
+    EVENING_STD_BUFFER_MIN = 8
+EVENING_STD_PROBE_OFFSETS_MIN = CONFIG.get("EVENING_STD_PROBE_OFFSETS_MIN", "0,10,20")
+try:
+    EVENING_STD_EXTRA_BUFFER_MIN = int(CONFIG.get("EVENING_STD_EXTRA_BUFFER_MIN", "3"))
+except ValueError:
+    EVENING_STD_EXTRA_BUFFER_MIN = 3
+# Human-centric constraints and preferences
+MAX_LEAVE_TIME_LOCAL = CONFIG.get("MAX_LEAVE_TIME_LOCAL", "")  # e.g., "19:30" or empty for none
+FRIDAY_EARLY_CUTOFF_LOCAL = CONFIG.get("FRIDAY_EARLY_CUTOFF_LOCAL", "")  # e.g., "17:30"
+LATE_PENALTY_START_LOCAL = CONFIG.get("LATE_PENALTY_START_LOCAL", "18:00")  # when late penalty starts
+try:
+    LATE_PENALTY_PER_15_MIN = int(CONFIG.get("LATE_PENALTY_PER_15_MIN", "2"))  # minutes of penalty per 15 minutes late
+except ValueError:
+    LATE_PENALTY_PER_15_MIN = 2
+
 # Personal off-login breaks during the day (e.g., smoking/me time), minutes per office day
 try:
     PERSONAL_BREAKS_MIN = int(CONFIG.get("PERSONAL_BREAKS_MIN", "0"))
@@ -665,6 +786,18 @@ except ValueError:
     GYM_MAX_DAYS_PER_WEEK = 3
 GYM_PREFERRED_DAYS = CONFIG.get("GYM_PREFERRED_DAYS", "MO,WE,FR")
 GYM_LEAVE_MODE = (CONFIG.get("GYM_LEAVE_MODE", "earliest") or "earliest").strip().lower()  # earliest|early
+try:
+    GYM_COMBO_MAX = int(CONFIG.get("GYM_COMBO_MAX", "60"))  # hard cap on gym option evaluations per day
+except ValueError:
+    GYM_COMBO_MAX = 60
+try:
+    GYM_DEFER_MAX_MINUTES = int(CONFIG.get("GYM_DEFER_MAX_MINUTES", "90"))  # max minutes to delay leaving office (no timebank)
+except ValueError:
+    GYM_DEFER_MAX_MINUTES = 90
+try:
+    GYM_DEFER_STEP_MINUTES = int(CONFIG.get("GYM_DEFER_STEP_MINUTES", "15"))
+except ValueError:
+    GYM_DEFER_STEP_MINUTES = 15
 
 def _parse_days_list(days_csv: str) -> set[str]:
     if not days_csv:
@@ -884,6 +1017,16 @@ def _build_arg_parser() -> argparse.ArgumentParser:
         help="Disable compact weekly rendering",
     )
     p.set_defaults(compact_weekly=None)
+    p.add_argument(
+        "--quiet",
+        action="store_true",
+        help="Suppress INFO logs during rendering (sets log level to WARNING)",
+    )
+    p.add_argument(
+        "--no-cache",
+        action="store_true",
+        help="Bypass route cache for this run (forces fresh Google Routes API requests)",
+    )
     return p
 
 ROUTES_URL = "https://routes.googleapis.com/directions/v2:computeRoutes"
@@ -897,16 +1040,42 @@ HEADERS = {
 }
 
 # --------------- API call budgeting and response cache ---------------
+DISABLE_ROUTE_CACHE = False
 try:
     MAX_API_CALLS_PER_RUN = int(CONFIG.get("MAX_API_CALLS_PER_RUN", "1000"))
 except ValueError:
     MAX_API_CALLS_PER_RUN = 1000
 try:
-    ROUTE_CACHE_GRANULARITY_MIN = int(CONFIG.get("ROUTE_CACHE_GRANULARITY_MIN", "5"))
+    BUDGET_SOFT_PCT = float(CONFIG.get("BUDGET_SOFT_PCT", "0.9"))
 except ValueError:
-    ROUTE_CACHE_GRANULARITY_MIN = 5
+    BUDGET_SOFT_PCT = 0.9
+def _parse_granularity(value: str | None, default_min: int = 5) -> tuple[int, int]:
+    """Parse granularity from env.
+    Accepts either a single int (e.g., "5") or a range "5..15".
+    Returns (bucket_minutes, probe_window_minutes).
+    """
+    if not value:
+        return (default_min, max(5, min(15, default_min)))
+    v = value.strip()
+    if ".." in v:
+        parts = v.split("..")
+        try:
+            base = int(parts[0])
+            probe = int(parts[1])
+            return (max(1, base), max(5, min(30, probe)))
+        except Exception:
+            return (default_min, max(5, min(15, default_min)))
+    try:
+        base = int(v)
+        return (max(1, base), max(5, min(15, base)))
+    except Exception:
+        return (default_min, max(5, min(15, default_min)))
+
+ROUTE_CACHE_GRANULARITY_MIN, ROUTE_CACHE_PROBE_WINDOW_MIN = _parse_granularity(CONFIG.get("ROUTE_CACHE_GRANULARITY_MIN", "5"), 5)
 ROUTE_CACHE: dict[tuple[str, str, str], float] = {}
 ROUTE_CACHE_TS: dict[tuple[str, str, str], float] = {}
+# Per-run in-memory cache (does not persist to disk); used even when DISABLE_ROUTE_CACHE is true
+SESSION_ROUTE_CACHE: dict[tuple[str, str, str], float] = {}
 API_CALL_COUNT = 0
 ROUTE_CACHE_FILE = CONFIG.get("ROUTE_CACHE_FILE", os.path.join(os.path.dirname(__file__), "routes_cache.json"))
 try:
@@ -931,6 +1100,25 @@ def _deserialize_cache_key(s: str) -> tuple[str, str, str] | None:
     except Exception:
         return None
 
+def _tz_name() -> str:
+    try:
+        return getattr(TZ, "key", str(TZ))
+    except Exception:
+        return "TZ"
+
+def _canonical_key(origin_addr: str, destination_addr: str, stamp: str) -> tuple[str, str, str]:
+    """Return canonical cache key tuple including TZ-qualified stamp."""
+    tz = _tz_name()
+    third = stamp if ("|" in stamp) else f"{tz}|{stamp}"
+    return (origin_addr, destination_addr, third)
+
+def _budget_soft_limit_reached() -> bool:
+    try:
+        threshold = int(MAX_API_CALLS_PER_RUN * max(0.1, min(1.0, BUDGET_SOFT_PCT)))
+        return API_CALL_COUNT >= threshold
+    except Exception:
+        return False
+
 def load_route_cache() -> None:
     try:
         if not os.path.exists(ROUTE_CACHE_FILE):
@@ -938,16 +1126,25 @@ def load_route_cache() -> None:
         with open(ROUTE_CACHE_FILE, "r", encoding="utf-8") as f:
             data = json.load(f)
         entries = 0
+        deduped = 0
         for k, v in data.items():
             key = _deserialize_cache_key(k)
             if not key:
                 continue
             dur = float(v.get("dur"))
             ts = float(v.get("ts", 0))
-            ROUTE_CACHE[key] = dur
-            ROUTE_CACHE_TS[key] = ts
+            # Promote legacy keys to canonical form to avoid duplicates
+            origin, dest, stamp = key
+            canonical = _canonical_key(origin, dest, stamp)
+            # Respect freshest timestamp if duplicates exist
+            existing_ts = ROUTE_CACHE_TS.get(canonical, 0)
+            if canonical in ROUTE_CACHE and ts <= existing_ts:
+                deduped += 1
+                continue
+            ROUTE_CACHE[canonical] = dur
+            ROUTE_CACHE_TS[canonical] = ts
             entries += 1
-        logger.info("Loaded route cache: %d entries from %s", entries, ROUTE_CACHE_FILE)
+        logger.info("Loaded route cache: %d entries (deduped %d) from %s", entries, deduped, ROUTE_CACHE_FILE)
     except Exception as e:
         logger.warning("Could not load route cache %s: %s", ROUTE_CACHE_FILE, e)
 
@@ -965,7 +1162,10 @@ def save_route_cache() -> None:
         # write
         out: dict[str, dict] = {}
         for k, dur in ROUTE_CACHE.items():
-            out[_serialize_cache_key(k)] = {"dur": float(dur), "ts": float(ROUTE_CACHE_TS.get(k, time.time()))}
+            # Ensure we only write canonical keys
+            origin, dest, stamp = k
+            k_can = _canonical_key(origin, dest, stamp)
+            out[_serialize_cache_key(k_can)] = {"dur": float(dur), "ts": float(ROUTE_CACHE_TS.get(k, time.time()))}
         tmp = ROUTE_CACHE_FILE + ".tmp"
         with open(tmp, "w", encoding="utf-8") as f:
             json.dump(out, f, ensure_ascii=False)
@@ -988,18 +1188,28 @@ def _floor_dt_to_step(dt_local: datetime, step_min: int) -> datetime:
     minute = (base.minute // step_min) * step_min
     return base.replace(minute=minute, second=0, microsecond=0)
 
+def _tz_name() -> str:
+    try:
+        return getattr(TZ, "key", str(TZ))
+    except Exception:
+        return "TZ"
+
+def _canonical_key(origin_addr: str, destination_addr: str, stamp: str) -> tuple[str, str, str]:
+    """Return canonical cache key tuple including TZ-qualified stamp."""
+    tz = _tz_name()
+    # If stamp already contains a pipe, assume it's canonical
+    third = stamp if ("|" in stamp) else f"{tz}|{stamp}"
+    return (origin_addr, destination_addr, third)
+
 def _candidate_cache_keys(origin_addr: str, destination_addr: str, departure_dt_local: datetime) -> list[tuple[str, str, str]]:
     """Generate candidate cache keys for a given request, tolerant to env changes.
     Keys include a TZ-qualified form and a legacy form without TZ to maximize reuse.
     Also probes nearby bucket times within a small window to survive granularity tweaks.
     """
-    try:
-        tz_name = getattr(TZ, "key", str(TZ))
-    except Exception:
-        tz_name = "TZ"
+    tz_name = _tz_name()
     base_time = _floor_dt_to_step(departure_dt_local, ROUTE_CACHE_GRANULARITY_MIN)
-    # Probe window of +/- up to 15 minutes in 5-minute steps
-    window = max(5, min(15, ROUTE_CACHE_GRANULARITY_MIN))
+    # Probe window derived from env (e.g., 5..15) in 5-minute steps
+    window = max(5, min(30, ROUTE_CACHE_PROBE_WINDOW_MIN))
     offsets = [0]
     for off in range(5, window + 1, 5):
         offsets.extend([-off, off])
@@ -1012,6 +1222,76 @@ def _candidate_cache_keys(origin_addr: str, destination_addr: str, departure_dt_
         # Legacy key (pre-v2) without TZ for backward reuse
         candidates.append((origin_addr, destination_addr, stamp))
     return candidates
+
+def _parse_int_list(csv: str) -> list[int]:
+    out: list[int] = []
+    for part in (csv or "").split(","):
+        p = part.strip()
+        if not p:
+            continue
+        try:
+            out.append(int(p))
+        except Exception:
+            continue
+    return out
+
+def _is_in_rush_window(dt_local: datetime) -> bool:
+    try:
+        h1, m1 = map(int, RUSH_WINDOW_START_LOCAL.split(":"))
+        h2, m2 = map(int, RUSH_WINDOW_END_LOCAL.split(":"))
+        t = dt_local.astimezone(TZ)
+        start = t.replace(hour=h1, minute=m1, second=0, microsecond=0)
+        end = t.replace(hour=h2, minute=m2, second=0, microsecond=0)
+        return start <= t <= end
+    except Exception:
+        return False
+
+def _dt_with_time_local(base_dt: datetime, hhmm: str) -> datetime:
+    h, m = map(int, hhmm.split(":"))
+    return base_dt.astimezone(TZ).replace(hour=h, minute=m, second=0, microsecond=0)
+
+def _latest_allowed_leave_for_day(baseline_departure: datetime) -> datetime:
+    """Compute the latest allowed leave time for the given day, considering:
+    - EXTEND_LATEST_LOCAL
+    - MAX_LEAVE_TIME_LOCAL (if set)
+    - FRIDAY_EARLY_CUTOFF_LOCAL (if Friday and set)
+    Returns a datetime in TZ.
+    """
+    local = baseline_departure.astimezone(TZ)
+    # Hard latest from extension config
+    h_latest, m_latest = map(int, EXTEND_LATEST_LOCAL.split(":"))
+    limit = local.replace(hour=h_latest, minute=m_latest, second=0, microsecond=0)
+    # Daily max leave if set
+    if MAX_LEAVE_TIME_LOCAL:
+        try:
+            t = _dt_with_time_local(local, MAX_LEAVE_TIME_LOCAL)
+            if t < limit:
+                limit = t
+        except Exception:
+            pass
+    # Friday early cutoff
+    if local.weekday() == 4 and FRIDAY_EARLY_CUTOFF_LOCAL:
+        try:
+            t = _dt_with_time_local(local, FRIDAY_EARLY_CUTOFF_LOCAL)
+            if t < limit:
+                limit = t
+        except Exception:
+            pass
+    return limit
+
+def _late_penalty_minutes(departure_dt: datetime) -> int:
+    """Return penalty in 'minutes-equivalent' for leaving late.
+    For every 15 minutes after LATE_PENALTY_START_LOCAL, apply LATE_PENALTY_PER_15_MIN.
+    """
+    try:
+        start = _dt_with_time_local(departure_dt, LATE_PENALTY_START_LOCAL)
+    except Exception:
+        return 0
+    if departure_dt <= start:
+        return 0
+    delta_min = max(0, int(math.ceil((departure_dt - start).total_seconds() / 60.0)))
+    steps = int(math.ceil(delta_min / 15.0))
+    return steps * max(0, int(LATE_PENALTY_PER_15_MIN))
 
 def fmt_hhmm(dt: datetime) -> str:
     return dt.astimezone(TZ).strftime("%H:%M")
@@ -1049,13 +1329,11 @@ def suggest_evening_extension(
     best_combo_any = None
     worse_streak = 0
     extra = step_minutes
-    # Stop if we pass the configured latest local time
-    h_latest, m_latest = map(int, EXTEND_LATEST_LOCAL.split(":"))
+    # Stop if we pass the latest allowed leave time for the day (human-centric)
+    day_limit = _latest_allowed_leave_for_day(baseline_departure)
     while True:
         depart = baseline_departure + timedelta(minutes=extra)
-        if depart.astimezone(TZ).hour > h_latest or (
-            depart.astimezone(TZ).hour == h_latest and depart.astimezone(TZ).minute > m_latest
-        ):
+        if depart > day_limit:
             break
         try:
             dur = compute_drive_duration_minutes(DESTINATION_ADDRESS, ORIGIN_ADDRESS, depart)
@@ -1066,17 +1344,21 @@ def suggest_evening_extension(
             extra += step_minutes
             continue
         save = baseline_duration_min - dur
-        if save > 0.5:  # require at least 0.5 minute improvement
+        penalty = _late_penalty_minutes(depart)
+        save_net = save - penalty
+        if save_net > 0.5:  # require at least 0.5 minute net improvement
             worse_streak = 0
-            if best is None or save > best["save"]:
+            if best is None or save_net > best["save_net"]:
                 best = {
                     "dep": depart,
                     "dur": dur,
                     "save": save,
+                    "save_net": save_net,
+                    "penalty_minutes": penalty,
                     "arr": depart + timedelta(minutes=dur),
                     "extend_minutes": extra,
                 }
-            if save >= EXTEND_TARGET_SAVE_MIN:
+            if save_net >= EXTEND_TARGET_SAVE_MIN:
                 break
         else:
             worse_streak += 1
@@ -1099,11 +1381,11 @@ def enumerate_evening_extensions(
     options: list[dict] = []
     worse_streak = 0
     extra = step_minutes
-    h_latest, m_latest = map(int, EXTEND_LATEST_LOCAL.split(":"))
+    day_limit = _latest_allowed_leave_for_day(baseline_departure)
     while True:
         depart = baseline_departure + timedelta(minutes=extra)
         local = depart.astimezone(TZ)
-        if local.hour > h_latest or (local.hour == h_latest and local.minute > m_latest):
+        if depart > day_limit:
             break
         try:
             dur = compute_drive_duration_minutes(DESTINATION_ADDRESS, ORIGIN_ADDRESS, depart)
@@ -1114,16 +1396,20 @@ def enumerate_evening_extensions(
             extra += step_minutes
             continue
         save = baseline_duration_min - dur
-        if save > 0.5:
+        penalty = _late_penalty_minutes(depart)
+        save_net = save - penalty
+        if save_net > 0.5:
             options.append({
                 "dep": depart,
                 "dur": dur,
                 "save": save,
+                "save_net": save_net,
+                "penalty_minutes": penalty,
                 "arr": depart + timedelta(minutes=dur),
                 "extend_minutes": extra,
             })
             worse_streak = 0
-            if save >= EXTEND_TARGET_SAVE_MIN and len(options) >= max_options:
+            if save_net >= EXTEND_TARGET_SAVE_MIN and len(options) >= max_options:
                 break
         else:
             worse_streak += 1
@@ -1148,14 +1434,14 @@ def evaluate_evening_range(
     options: list[dict] = []
     worse_streak = 0
     extra = 0
-    h_latest, m_latest = map(int, EXTEND_LATEST_LOCAL.split(":"))
+    day_limit = _latest_allowed_leave_for_day(baseline_departure)
     worst_dur = baseline_duration_min
     worst_dep = baseline_departure
     worst_arr = baseline_departure + timedelta(minutes=baseline_duration_min)
     while True:
         depart = baseline_departure + timedelta(minutes=extra)
         local = depart.astimezone(TZ)
-        if local.hour > h_latest or (local.hour == h_latest and local.minute > m_latest):
+        if depart > day_limit:
             break
         try:
             dur = compute_drive_duration_minutes(DESTINATION_ADDRESS, ORIGIN_ADDRESS, depart) if extra else baseline_duration_min
@@ -1211,16 +1497,16 @@ def compute_drive_duration_minutes(origin_addr: str, destination_addr: str, depa
     # Budget and caching
     global API_CALL_COUNT
     key_time = _floor_dt_to_step(departure_dt_local, ROUTE_CACHE_GRANULARITY_MIN)
-    try:
-        tz_name = getattr(TZ, "key", str(TZ))
-    except Exception:
-        tz_name = "TZ"
-    canonical_key = (origin_addr, destination_addr, f"{tz_name}|{key_time.strftime('%Y-%m-%d %H:%M')}")
+    canonical_key = _canonical_key(origin_addr, destination_addr, key_time.strftime('%Y-%m-%d %H:%M'))
+    # Check session cache first (always on), then persistent cache if allowed
     for k in _candidate_cache_keys(origin_addr, destination_addr, departure_dt_local):
-        if k in ROUTE_CACHE:
+        if k in SESSION_ROUTE_CACHE:
+            return SESSION_ROUTE_CACHE[k]
+        if (not DISABLE_ROUTE_CACHE) and (k in ROUTE_CACHE):
             dur = ROUTE_CACHE[k]
             ROUTE_CACHE[canonical_key] = dur
             ROUTE_CACHE_TS[canonical_key] = ROUTE_CACHE_TS.get(k, time.time())
+            SESSION_ROUTE_CACHE[canonical_key] = dur
             return dur
     if API_CALL_COUNT >= MAX_API_CALLS_PER_RUN:
         raise RuntimeError(f"API call budget exceeded ({MAX_API_CALLS_PER_RUN}). Increase MAX_API_CALLS_PER_RUN or widen cache granularity.")
@@ -1252,8 +1538,10 @@ def compute_drive_duration_minutes(origin_addr: str, destination_addr: str, depa
     if not dur:
         raise RuntimeError("Antwort enthält keine duration.")
     dur_min = parse_duration_to_minutes(dur)
-    ROUTE_CACHE[canonical_key] = dur_min
-    ROUTE_CACHE_TS[canonical_key] = time.time()
+    SESSION_ROUTE_CACHE[canonical_key] = dur_min
+    if not DISABLE_ROUTE_CACHE:
+        ROUTE_CACHE[canonical_key] = dur_min
+        ROUTE_CACHE_TS[canonical_key] = time.time()
     API_CALL_COUNT += 1
     return dur_min
 
@@ -1561,6 +1849,8 @@ def scan_morning_best_departure(day_local: datetime) -> dict:
             pr = None
 
     current = start_dt
+    calls_used = 0
+    budget = MAX_API_CALLS_PER_RUN
     while current <= latest_arrival_dt:
         # Nur zukünftige Zeitpunkte an die API senden
         if current <= now_local:
@@ -1569,6 +1859,7 @@ def scan_morning_best_departure(day_local: datetime) -> dict:
         try:
             logger.debug("Candidate departure: %s", current.astimezone(TZ).strftime("%H:%M"))
             dur_min = compute_drive_duration_minutes(ORIGIN_ADDRESS, DESTINATION_ADDRESS, current)
+            calls_used += 1
         except Exception as e:
             last_error_message = str(e)
             logger.debug("Slot error: %s", last_error_message)
@@ -1576,6 +1867,9 @@ def scan_morning_best_departure(day_local: datetime) -> dict:
             if pr:
                 pr.update(1)
             continue
+        # Soft-guard: if cache disabled and we're near budget, stop early to prevent hard failure
+        if DISABLE_ROUTE_CACHE and calls_used >= max(1, int(budget * 0.8)):
+            break
 
         arrival = current + timedelta(minutes=dur_min)
 
@@ -1648,17 +1942,22 @@ def choose_best_evening_departure(morning_arrival_local: datetime) -> dict:
         except Exception:
             pr = None
 
+    calls_used = 0
+    budget = MAX_API_CALLS_PER_RUN
     for L in range(LUNCH_MIN_MINUTES, LUNCH_MAX_MINUTES + 1, LUNCH_STEP_MINUTES):
         # Personal breaks are mandatory and stack with lunch
         mandatory_breaks = L + PERSONAL_BREAKS_MIN
         evening_departure = morning_arrival_local + timedelta(minutes=work_minutes + mandatory_breaks)
         try:
             dur_min = compute_drive_duration_minutes(DESTINATION_ADDRESS, ORIGIN_ADDRESS, evening_departure)
+            calls_used += 1
         except Exception as e:
             last_error_message = str(e)
             if pr:
                 pr.update(1)
             continue
+        if DISABLE_ROUTE_CACHE and calls_used >= max(1, int(budget * 0.8)):
+            break
 
         if best["evening_duration_minutes"] is None or dur_min < best["evening_duration_minutes"]:
             best["lunch_minutes"] = L
@@ -1699,14 +1998,15 @@ def choose_best_evening_departure_with_extension(morning_arrival_local: datetime
         worse_steps_limit=EXTEND_WORSE_STEPS,
     )
     result = {"base": base}
-    if ext and ext["save"] >= EXTEND_TARGET_SAVE_MIN:
+    if ext and ext.get("save_net", ext.get("save", 0)) >= EXTEND_TARGET_SAVE_MIN:
         result["extended"] = {
             "lunch_minutes": base["lunch_minutes"],
             "evening_departure": ext["dep"],
             "evening_duration_minutes": ext["dur"],
             "evening_arrival_home": ext["arr"],
             "extend_minutes": ext["extend_minutes"],
-            "save_minutes": ext["save"],
+            "save_minutes": ext.get("save_net", ext.get("save", 0)),
+            "penalty_minutes": ext.get("penalty_minutes", 0),
         }
     return result
 
@@ -1757,7 +2057,11 @@ def choose_best_evening_departure_with_timebank(morning_arrival_local: datetime,
                         best_combo_any = combo_any
             except Exception:
                 continue
-        return {"base": base, **({"spend": best_combo_any} if best_combo_any else {})}
+        out = {"base": base}
+        if best_combo_any:
+            out["spend"] = best_combo_any
+            out["best_any"] = best_combo_any
+        return out
 
     # Try leaving earlier and waiting outside office up to max_spend
     best = None
@@ -1766,7 +2070,7 @@ def choose_best_evening_departure_with_timebank(morning_arrival_local: datetime,
     spend = step if GYM_LEAVE_MODE == "early" else max(step, GYM_TRAIN_MIN_MINUTES)
     # Gym options progress reporter: approximate combinations across spend, gyms, and training durations
     pr = None
-    if logger.isEnabledFor(logging.INFO):
+    if logger.isEnabledFor(logging.INFO) and (not _budget_soft_limit_reached()):
         try:
             total_spend_steps = max(1, timebank_available_min // step)
             total_train_steps = max(1, (GYM_TRAIN_MAX_MINUTES - GYM_TRAIN_MIN_MINUTES) // max(1, GYM_TRAIN_STEP_MINUTES) + 1)
@@ -1774,7 +2078,9 @@ def choose_best_evening_departure_with_timebank(morning_arrival_local: datetime,
             pr = ProgressReporter("Gym Options", total)
         except Exception:
             pr = None
-    while spend <= max_spend:
+    combos_used = 0
+    stop_due_to_cap = False
+    while spend <= max_spend and not stop_due_to_cap:
         # Leave early (reduce office) by 'spend' minutes if mode=early, else leave at earliest_end and only vary training
         leave_office = earliest_end - timedelta(minutes=spend) if GYM_LEAVE_MODE == "early" else earliest_end
         # we then go to gym and depart later when traffic improves; compute travel via gym
@@ -1794,15 +2100,16 @@ def choose_best_evening_departure_with_timebank(morning_arrival_local: datetime,
                     gym2home = compute_drive_duration_minutes(gym_addr, ORIGIN_ADDRESS, depart_homeward)
                     total_evening_drive = off2gym + gym2home
                     save = dur_base - total_evening_drive
+                    spend_used = spend if GYM_LEAVE_MODE == "early" else 0
                     combo_any = {
                         "leave_office": leave_office,
-                        "wait_minutes": spend,
+                        "wait_minutes": spend_used,
                         "gym_address": gym_addr,
                         "train_minutes": train_min,
                         "evening_departure": depart_homeward,  # leaving gym by car
                         "evening_duration_minutes": gym2home,
                         "evening_arrival_home": depart_homeward + timedelta(minutes=gym2home),
-                        "spend_minutes": spend,
+                        "spend_minutes": spend_used,
                         "save_minutes": save,
                         "office_to_gym_minutes": off2gym,
                     }
@@ -1815,6 +2122,12 @@ def choose_best_evening_departure_with_timebank(morning_arrival_local: datetime,
                         best_combo_any = combo_any
                     if pr:
                         pr.update(1)
+                    combos_used += 1
+                    if combos_used >= max(1, int(GYM_COMBO_MAX)):
+                        stop_due_to_cap = True
+                        break
+                if stop_due_to_cap:
+                    break
         except Exception:
             spend += step
             continue
@@ -1824,6 +2137,9 @@ def choose_best_evening_departure_with_timebank(morning_arrival_local: datetime,
         if best is None or best_combo["save_minutes"] > best["save_minutes"]:
             best = best_combo
         spend += step
+        # If approaching budget, stop exploring further to avoid hard cap
+        if _budget_soft_limit_reached():
+            break
     if pr:
         pr.done()
     # If no saving option found, fall back to the absolute-min drive combo so we can still go to the gym
@@ -1832,6 +2148,8 @@ def choose_best_evening_departure_with_timebank(morning_arrival_local: datetime,
     out = {"base": base}
     if best:
         out["spend"] = best
+    if best_combo_any:
+        out["best_any"] = best_combo_any
     return out
 
 def optimize_day_with_extension(day_local: datetime) -> dict | None:
@@ -1876,9 +2194,16 @@ def optimize_day_with_extension(day_local: datetime) -> dict | None:
             break
         # evening with extension
         eve = choose_best_evening_departure_with_extension(cand_arr)
-        eve_best_dur = eve.get("extended", eve["base"]) ["evening_duration_minutes"]
-        total = dur_min + eve_best_dur
-        if best is None or total < best["total_travel_minutes"]:
+        chosen_eve = eve.get("extended") or eve["base"]
+        eve_best_dur = chosen_eve["evening_duration_minutes"]
+        # Add lifestyle penalty if extending
+        penalty = 0
+        if "penalty_minutes" in chosen_eve:
+            penalty = max(0, int(round(chosen_eve.get("penalty_minutes", 0))))
+        elif chosen_eve is not eve["base"]:
+            penalty = _late_penalty_minutes(chosen_eve["evening_departure"])  # fallback
+        total_score = dur_min + eve_best_dur + penalty
+        if best is None or total_score < best.get("total_score", 1e9):
             chosen = eve.get("extended", None)
             best = {
                 "morning": {"best_departure": cand_dep, "best_arrival": cand_arr, "best_duration_minutes": dur_min},
@@ -1888,13 +2213,16 @@ def optimize_day_with_extension(day_local: datetime) -> dict | None:
                 "evening_arrival_home": (chosen or eve["base"]) ["evening_arrival_home"],
                 "extend_minutes": (chosen or {}).get("extend_minutes", 0),
                 "save_minutes": (chosen or {}).get("save_minutes", 0),
-                "total_travel_minutes": total,
+                "penalty_minutes": penalty,
+                "total_travel_minutes": dur_min + eve_best_dur,
+                "total_score": total_score,
             }
         if pr:
             pr.update(1)
     if pr:
         pr.done()
-    if best and best["total_travel_minutes"] + 0.1 < base_total:
+    # Compare using score (travel + penalty) to accept improvements
+    if best and (best.get("total_score", 1e9) + 0.1) < (base_total + _late_penalty_minutes(base_evening["base"]["evening_departure"])):
         return best
     return None
 
@@ -1909,6 +2237,12 @@ def main():
         compact_weekly=args.compact_weekly,
     )
     ensure_api_key_configured()
+    if getattr(args, "quiet", False):
+        logger.setLevel(logging.WARNING)
+    # Disable cache per flag
+    global DISABLE_ROUTE_CACHE
+    if getattr(args, "no_cache", False):
+        DISABLE_ROUTE_CACHE = True
     # Prepare API client (towards refactor)
     global API_CLIENT
     try:

@@ -58,6 +58,11 @@ EXTEND_LATEST_LOCAL=22:00
 EXTEND_TARGET_SAVE_MIN=10
 AVOID_THRESHOLD_MIN=8
 AVOID_STEP_MINUTES=15
+# Menschliche Präferenzen / Grenzen
+MAX_LEAVE_TIME_LOCAL=19:30         # späteste akzeptable Abfahrtszeit (hartes Tageslimit)
+FRIDAY_EARLY_CUTOFF_LOCAL=17:30    # freitags bevorzugt früh gehen (härteste Schranke gewinnt)
+LATE_PENALTY_START_LOCAL=18:00     # ab wann ein „Lifestyle“-Malus greift
+LATE_PENALTY_PER_15_MIN=2          # Malus-Minuten je 15 Min nach LATE_PENALTY_START_LOCAL
 # Zeitkonto (Kompensation)
 TIMEBANK_CURRENT_MIN=0              # aktuelles Plus (Minuten), z. B. 120 für +2h
 TIMEBANK_CAP_MIN=3000               # Obergrenze (Minuten), Standard 3000 (=50h)
@@ -72,12 +77,13 @@ GYM_TRAIN_MIN_MINUTES=90
 GYM_TRAIN_MAX_MINUTES=120
 GYM_TRAIN_STEP_MINUTES=15
 GYM_MAX_DAYS_PER_WEEK=3
-GYM_PREFERRED_DAYS=MO,WE,FR     # choose gym on these weekdays if beneficial
+GYM_PREFERRED_DAYS=MO,WE,FR     # bevorzugte Wochentage für Gym (Auswahl priorisiert)
 GYM_LEAVE_MODE=earliest         # earliest: leave at earliest end; early: allow leaving earlier using timebank
+GYM_COMBO_MAX=60                # Performance-Kappe für Gym-Kombinationen pro Tag
 
 # API-Budget & Caching
 MAX_API_CALLS_PER_RUN=300       # harte Obergrenze pro Scriptlauf
-ROUTE_CACHE_GRANULARITY_MIN=5   # Route-Cache-Raster (min) für DepartureTime-Rundung
+ROUTE_CACHE_GRANULARITY_MIN=5..15   # Cache-Raster und Probe-Fenster ("Bucket..ProbeWindow" in Minuten)
 ROUTE_CACHE_FILE=routes_cache.json
 ROUTE_CACHE_MAX_ENTRIES=50000
 ```
@@ -109,12 +115,14 @@ python pendelplaner.py
 
 ### CLI-Optionen
 ```bash
-python pendelplaner.py [--color auto|always|never] [--ascii] [--width N] [--compact-weekly|--no-compact-weekly]
+python pendelplaner.py [--color auto|always|never] [--ascii] [--width N] [--compact-weekly|--no-compact-weekly] [--quiet] [--no-cache]
 ```
 - `--color`: Farbmodus (Standard aus `COLOR_OUTPUT` oder automatisch TTY-abhängig; respektiert `NO_COLOR`).
 - `--ascii`: Erzwingt ASCII-Ausgabe (z. B. in Logs/CI ohne UTF‑8).
 - `--width`: Maximale Breite für Trennlinien (Standard: automatische Terminalbreite, 40..120).
 - `--compact-weekly`/`--no-compact-weekly`: Kompakte Wochenansicht umschalten.
+- `--quiet`: Unterdrückt INFO-Logs während des Renderings (nur WARN/ERROR).
+- `--no-cache`: Umgeht den lokalen Route-Cache für diesen Lauf (erzwingt frische API-Abfragen).
 
 Beispiele:
 ```bash
