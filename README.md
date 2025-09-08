@@ -93,19 +93,6 @@ Erläuterung Zeitkonto:
 - Dabei kann – falls konfiguriert – vom Zeitkonto „verbraucht“ werden (`TIMEBANK_CURRENT_MIN`), begrenzt pro Tag (`TIMEBANK_MAX_SPEND_PER_DAY_MIN`) und insgesamt (`TIMEBANK_CAP_MIN`).
 - Das Ziel ist, die Gesamtfahrzeit zu reduzieren und die Wartezeit sinnvoll zu nutzen, ohne die Bank-Grenzen zu überschreiten.
 
-## Optional pro Wochentag Halbtag-Slots statt WEEKLY_BLOCKS (office|home|off)
-Beispiel: Montag Office am Morgen, Home am Nachmittag
-MO_AM=office
-MO_PM=home
-TU_AM=home
-TU_PM=off
-WE_AM=
-WE_PM=
-TH_AM=
-TH_PM=
-FR_AM=
-FR_PM=
-```
 
 ## Nutzung
 ```bash
