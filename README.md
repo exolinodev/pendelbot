@@ -18,7 +18,7 @@ pip install -r requirements.txt
 Erstelle eine Datei `.env` im Projektverzeichnis (oder passe die vorhandene an):
 ```ini
 GOOGLE_MAPS_API_KEY=DEIN_API_KEY
-ORIGIN_ADDRESS=Rümlangstrasse 54, 8052 Zürich
+ORIGIN_ADDRESS=Bahnhofstrasse 1, 8000 Zürich
 DESTINATION_ADDRESS=Bahnhofstrasse 25, 5647 Oberrüti
 LATEST_ARRIVAL_LOCAL=09:00
 MORNING_WINDOW_START_LOCAL=05:00
