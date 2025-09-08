@@ -71,8 +71,8 @@ EXTENSION_ACTIVITY=gym              # gym|work – beschreibt, was du in der Ext
 
 # Gym-Optionen
 GYM_ENABLED=1
-GYM_ADDRESS_1=Suurstoffi 8/10, 6343 Risch-Rotkreuz
-GYM_ADDRESS_2=Baarerstrasse 53, 6300 Zug
+GYM_ADDRESS_1=Adresse 1
+GYM_ADDRESS_2=Adresse 2
 GYM_TRAIN_MIN_MINUTES=90
 GYM_TRAIN_MAX_MINUTES=120
 GYM_TRAIN_STEP_MINUTES=15
