@@ -766,8 +766,11 @@ try:
     GYM_ENABLED = (CONFIG.get("GYM_ENABLED", "1") or "1").strip().lower() in {"1","true","yes","y","on"}
 except Exception:
     GYM_ENABLED = True
-GYM_ADDRESS_1 = CONFIG.get("GYM_ADDRESS_1", "Suurstoffi 8/10, 6343 Risch-Rotkreuz")
-GYM_ADDRESS_2 = CONFIG.get("GYM_ADDRESS_2", "Baarerstrasse 53, 6300 Zug")
+# Read gym addresses only from env; no hardcoded defaults
+GYM_ADDRESS_1 = (CONFIG.get("GYM_ADDRESS_1", "") or "").strip()
+GYM_ADDRESS_2 = (CONFIG.get("GYM_ADDRESS_2", "") or "").strip()
+# Build a list of configured gym addresses (non-empty only)
+GYM_ADDRESSES: list[str] = [addr for addr in [GYM_ADDRESS_1, GYM_ADDRESS_2] if addr]
 try:
     GYM_TRAIN_MIN_MINUTES = int(CONFIG.get("GYM_TRAIN_MIN_MINUTES", "90"))
 except ValueError:
@@ -2035,7 +2038,7 @@ def choose_best_evening_departure_with_timebank(morning_arrival_local: datetime,
     if max_spend <= 0:
         best_combo_any = None
         leave_office = earliest_end
-        for gym_addr in (GYM_ADDRESS_1, GYM_ADDRESS_2):
+        for gym_addr in (GYM_ADDRESSES or []):
             try:
                 off2gym = compute_drive_duration_minutes(DESTINATION_ADDRESS, gym_addr, leave_office)
                 for train_min in range(GYM_TRAIN_MIN_MINUTES, GYM_TRAIN_MAX_MINUTES + 1, GYM_TRAIN_STEP_MINUTES):
@@ -2087,7 +2090,7 @@ def choose_best_evening_departure_with_timebank(morning_arrival_local: datetime,
         # scan training durations and both gym locations, include office->gym and gym->home drives
         try:
             best_combo = None
-            for gym_addr in (GYM_ADDRESS_1, GYM_ADDRESS_2):
+            for gym_addr in (GYM_ADDRESSES or []):
                 # commute office -> gym at leave_office
                 off2gym = compute_drive_duration_minutes(DESTINATION_ADDRESS, gym_addr, leave_office)
                 for train_min in range(GYM_TRAIN_MIN_MINUTES, GYM_TRAIN_MAX_MINUTES + 1, GYM_TRAIN_STEP_MINUTES):

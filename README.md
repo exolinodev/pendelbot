@@ -18,7 +18,7 @@ pip install -r requirements.txt
 Erstelle eine Datei `.env` im Projektverzeichnis (oder passe die vorhandene an):
 ```ini
 GOOGLE_MAPS_API_KEY=DEIN_API_KEY
-ORIGIN_ADDRESS=Bahnhofstrasse 1, 8000 Zürich
+ORIGIN_ADDRESS=Rümlangstrasse 54, 8052 Zürich
 DESTINATION_ADDRESS=Bahnhofstrasse 25, 5647 Oberrüti
 LATEST_ARRIVAL_LOCAL=09:00
 MORNING_WINDOW_START_LOCAL=05:00
@@ -71,8 +71,8 @@ EXTENSION_ACTIVITY=gym              # gym|work – beschreibt, was du in der Ext
 
 # Gym-Optionen
 GYM_ENABLED=1
-GYM_ADDRESS_1=Adresse 1
-GYM_ADDRESS_2=Adresse 2
+GYM_ADDRESS_1=<GYM_ADDRESS_1>
+GYM_ADDRESS_2=<GYM_ADDRESS_2>
 GYM_TRAIN_MIN_MINUTES=90
 GYM_TRAIN_MAX_MINUTES=120
 GYM_TRAIN_STEP_MINUTES=15
@@ -93,6 +93,19 @@ Erläuterung Zeitkonto:
 - Dabei kann – falls konfiguriert – vom Zeitkonto „verbraucht“ werden (`TIMEBANK_CURRENT_MIN`), begrenzt pro Tag (`TIMEBANK_MAX_SPEND_PER_DAY_MIN`) und insgesamt (`TIMEBANK_CAP_MIN`).
 - Das Ziel ist, die Gesamtfahrzeit zu reduzieren und die Wartezeit sinnvoll zu nutzen, ohne die Bank-Grenzen zu überschreiten.
 
+# Optional pro Wochentag Halbtag-Slots statt WEEKLY_BLOCKS (office|home|off)
+# Beispiel: Montag Office am Morgen, Home am Nachmittag
+MO_AM=office
+MO_PM=home
+TU_AM=home
+TU_PM=off
+WE_AM=
+WE_PM=
+TH_AM=
+TH_PM=
+FR_AM=
+FR_PM=
+```
 
 ## Nutzung
 ```bash
